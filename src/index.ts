@@ -11,8 +11,8 @@
  *  - 只读投影：只订阅 session/event 读取，绝不写 session log；
  *  - 雷区注入：agent 即将触碰 Trap 文件时，经 agent.inject() 注入带证据的警告。
  */
-import type { Context } from 'cordis'
-import z from 'schemastery'
+import type { Context } from '@deepseek-ai/cordis'
+import z from '@deepseek-ai/schemastery'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
@@ -134,19 +134,23 @@ export function apply(ctx: AppContext, config: Config): void {
   const workspace = config.workspace || process.cwd()
   mkdirSync(dataDir, { recursive: true })
 
-  // ─── 图实例 + 日志重放 ───
+  // ─── 图实例（懒加载：replay/扫描异步执行，apply 立即返回，
+  //     避免同步解析 7MB+ 日志/全量扫描仓库阻塞事件循环——热重载时卡死整个 web 进程）───
   const journalPath = join(dataDir, 'graph.jsonl')
   const graph = new CogniGraph(journalPath)
-  if (existsSync(journalPath)) {
-    try {
-      graph.replay(readFileSync(journalPath, 'utf8').split('\n'))
-      ctx.logger?.info?.(`[cognigraph] 重放日志完成：${graph.nodeCount} 节点 / ${graph.edgeCount} 边`)
-    } catch (e) {
-      ctx.logger?.warn?.(`[cognigraph] 日志重放失败（重建空图）：${String(e)}`)
+  const graphReady: Promise<void> = (async () => {
+    if (existsSync(journalPath)) {
+      try {
+        const content = readFileSync(journalPath, 'utf8')
+        graph.replayIncremental(content)
+        ctx.logger?.info?.(`[cognigraph] 重放日志完成：${graph.nodeCount} 节点 / ${graph.edgeCount} 边`)
+      } catch (e) {
+        ctx.logger?.warn?.(`[cognigraph] 日志重放失败（重建空图）：${String(e)}`)
+      }
     }
-  }
+  })()
 
-  // ─── 静态层：CodeGraph 导入优先，内置扫描兜底 ───
+  // ─── 静态层：CodeGraph 导入优先，内置扫描兜底（异步执行；幂等 upsert）───
   const buildStaticLayer = (): { source: string; detail: string } => {
     if (config.codegraphExportPath && existsSync(config.codegraphExportPath)) {
       try {
@@ -169,34 +173,50 @@ export function apply(ctx: AppContext, config: Config): void {
   }
 
   if (config.scanOnStart) {
-    const { source, detail } = buildStaticLayer()
-    ctx.logger?.info?.(`[cognigraph] 静态层就绪（${source}）：${detail}`)
+    void graphReady.then(() => {
+      // 幂等：静态层节点已存在时跳过全量重扫（热重载/重启不会重复扫描，省同步时间）
+      const hasStatic = graph.allNodes().some((n) => n.type === 'CodeFile' || n.type === 'Function')
+      if (hasStatic && !config.codegraphExportPath) {
+        ctx.logger?.info?.(`[cognigraph] 静态层已存在（${graph.nodeCount} 节点），跳过重扫`)
+        return
+      }
+      const { source, detail } = buildStaticLayer()
+      ctx.logger?.info?.(`[cognigraph] 静态层就绪（${source}）：${detail}`)
+    }).catch((e) => ctx.logger?.warn?.(`[cognigraph] 静态层构建失败：${String(e)}`))
   }
 
   // ─── 动态层：session/event 痕迹投影 ───
   const lastInjectedAt = new Map<string, number>()
+  // 事件可能早于 replay 完成到达（重载瞬间）；等待就绪后按序处理，
+  // 避免"先写新统计、再被旧日志重放覆盖"的双计数。
+  let replayWaiter: Promise<void> | null = null
   ctx.on('session/event', (session: { id: string }, event: TraceEvent) => {
     if (!config.traceEnabled) return
     if (event.type !== 'tool/call' && event.type !== 'tool/result') return
-    try {
-      if (event.type === 'tool/call') {
-        const { name: tool, arguments: rawArgs } = (event.data ?? {}) as { name: string; arguments: string }
-        let args: unknown
-        try {
-          args = JSON.parse(rawArgs)
-        } catch {
-          return
-        }
-        // 绝对路径 → 工作区相对路径（与静态层统一；工作区外路径保留原样）
-        if (typeof args === 'object' && args !== null) {
-          const a = args as Record<string, unknown>
-          for (const key of ['file_path', 'path']) {
-            const v = a[key]
-            if (typeof v === 'string' && v.length > 0) {
-              a[key] = toWorkspaceRelative(v, workspace)
+    // 首次事件：等待 replay 完成后再开始投影（后续事件不等待，保持同步路径）
+    if (replayWaiter === null) {
+      replayWaiter = graphReady.catch(() => {})
+    }
+    void (replayWaiter ?? Promise.resolve()).then(() => {
+      try {
+        if (event.type === 'tool/call') {
+          const { name: tool, arguments: rawArgs } = (event.data ?? {}) as { name: string; arguments: string }
+          let args: unknown
+          try {
+            args = JSON.parse(rawArgs)
+          } catch {
+            return
+          }
+          // 绝对路径 → 工作区相对路径（与静态层统一；工作区外路径保留原样）
+          if (typeof args === 'object' && args !== null) {
+            const a = args as Record<string, unknown>
+            for (const key of ['file_path', 'path']) {
+              const v = a[key]
+              if (typeof v === 'string' && v.length > 0) {
+                a[key] = toWorkspaceRelative(v, workspace)
+              }
             }
           }
-        }
         // 读/写计数：projectToolCall 内部按工具名分类
         const touched = projectToolCall(graph, tool, args, false, null, event.seq, {
           trapErrorThreshold: config.trapErrorThreshold,
@@ -248,6 +268,7 @@ export function apply(ctx: AppContext, config: Config): void {
     } catch (e) {
       ctx.logger?.warn?.(`[cognigraph] 痕迹投影失败：${String(e)}`)
     }
+    })
   })
 
   // ─── 决策层：LLM 蒸馏（默认关闭，distillEnabled 开启）───
@@ -602,13 +623,15 @@ export function apply(ctx: AppContext, config: Config): void {
     presentCall: (args) => ({ card: 'generic', title: '存档决策', kind: 'other', rawInput: args.topic }),
   }))
 
-  // ─── 生命周期：退出时落盘全量日志 ───
+  // ─── 生命周期：退出时落盘全量日志（等 replay 完成后写，防重载瞬间写出空图）───
   ctx.effect(() => () => {
-    try {
-      writeFileSync(journalPath, graph.exportJournal().join('\n') + '\n', 'utf8')
-    } catch {
-      // 落盘失败不影响退出
-    }
+    void graphReady.then(() => {
+      try {
+        writeFileSync(journalPath, graph.exportJournal().join('\n') + '\n', 'utf8')
+      } catch {
+        // 落盘失败不影响退出
+      }
+    })
   })
 
   // ─── UI 数据路由（webServer 为可选服务：headless 无 UI，跳过注册）───

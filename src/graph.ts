@@ -93,6 +93,8 @@ export class CogniGraph {
   private nextId = 1
   private journalPath: string
   private writeQueue: Promise<void> = Promise.resolve()
+  /** 已重放的日志字节数（增量重放 checkpoint）。 */
+  private replayedBytes = 0
 
   constructor(journalPath: string) {
     this.journalPath = journalPath
@@ -342,6 +344,23 @@ export class CogniGraph {
         // 单行损坏：跳过该行，不影响其余重放
       }
     }
+  }
+
+  /**
+   * 增量重放：从上次 checkpoint 字节偏移起只解析新增行。
+   * 避免每次重载/重启全量解析大日志（7MB+ 时同步解析可达数秒，阻塞事件循环）。
+   * @param content - 日志文件的完整文本（调用方已读）。
+   * @returns 本次新重放的行数。
+   */
+  replayIncremental(content: string): number {
+    if (content.length <= this.replayedBytes) return 0
+    const fresh = content.slice(this.replayedBytes)
+    // 从行首开始（checkpoint 可能在行中间：取第一个 \n 之后）
+    const start = fresh.indexOf('\n')
+    const lines = (start === -1 ? fresh : fresh.slice(start + 1)).split('\n')
+    this.replayedBytes = content.length
+    this.replay(lines)
+    return lines.length
   }
 
   /** 导出全部日志行（落盘用）。 */

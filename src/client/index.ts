@@ -4,7 +4,12 @@
  * 颜色按类型区分，节点大小按行为热力缩放；下方列表展示雷区与热点统计。
  * 数据来自 host API：/api/stats（统计）与 /api/graph（图谱快照）。
  * 构建：npm run build:client（tsdown，产物 lib/client.js，ModuleLoader.load 注册）。
+ *
+ * ⚠️ 渲染契约：conversation.view slot 的 component 必须是 React 函数组件
+ * （SlotComponent<P> = (props) => ReactNode），返回 DOM 对象会渲染空白。
+ * 本面板的 DOM 渲染逻辑包在 React 壳组件内（useEffect 挂载），复用全部渲染代码。
  */
+import React, { useEffect, useRef } from 'react'
 import type { SlotsService } from '@deepseek-ai/dsh-client-ui-slots'
 
 type ClientContext = {
@@ -320,18 +325,22 @@ function renderSide(side: HTMLElement, stats: StatsDto): void {
   section('🔥 热点', stats.hot.map((h) => ({ name: h.name, detail: `读${h.readCount}/改${h.editCount}` })), '#ffb340')
 }
 
+/** React 壳组件：把 DOM 渲染面板挂载到组件容器（slot 契约要求 React 组件）。 */
+function CogniPanel(): React.JSX.Element {
+  const ref = useRef<HTMLDivElement | null>(null)
+  useEffect(() => {
+    if (ref.current) renderPanel(ref.current)
+  }, [])
+  return React.createElement('div', { ref })
+}
+
 export function apply(ctx: ClientContext): void {
   ctx.effect(() => ctx.slots.inject('conversation.view', () =>
     ctx.slots.register({
       name: 'conversation.view',
       id: '@dsh-external/dsh-repo-cognigraph-panel',
       label: () => '认知图谱',
-      component: () => ({
-        render(el: HTMLElement) {
-          renderPanel(el)
-          return el
-        },
-      }),
+      component: CogniPanel,
     }),
   ), '@dsh-external/dsh-repo-cognigraph: panel')
 }
