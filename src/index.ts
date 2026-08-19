@@ -22,6 +22,7 @@ import { CogniGraph } from './graph.ts'
 import { importCodeGraphJson } from './codegraph-import.ts'
 import { scanWorkspace } from './scanner.ts'
 import { projectToolCall, normalizePath } from './trace.ts'
+import { distill, applyDistilledFact, type DistillConfig, type DistilledFact } from './distill.ts'
 
 /** 会话事件的最小形态（只读投影所需字段；完整类型属于 dsh-session，不在此依赖）。 */
 interface TraceEvent {
@@ -33,6 +34,18 @@ interface TraceEvent {
 /** Agent 的最小形态（雷区注入所需字段；完整类型属于 dsh-agent，不在此依赖）。 */
 interface TraceAgent {
   inject(message: unknown): void
+}
+
+/** LLM 服务最小形态（蒸馏用；完整类型属于 dsh-llm，不在此依赖）。 */
+interface DistillLlm {
+  stream(options: {
+    provider: string
+    model: string
+    system?: string
+    messages: unknown[]
+    temperature?: number
+    maxTokens?: number
+  }): AsyncIterable<{ type: string; text?: string }>
 }
 
 type AppContext = Context & {
@@ -65,6 +78,18 @@ export interface Config {
   injectionCooldownMs: number
   /** 启动时是否自动扫描工作区建静态图。 */
   scanOnStart: boolean
+  /** 决策蒸馏层：是否启用自动蒸馏（LLM）。 */
+  distillEnabled: boolean
+  /** 自上次蒸馏以来新增 user 消息数 ≥ 该值才触发。 */
+  distillMinNewUserMessages: number
+  /** 单次蒸馏输入最大字符数。 */
+  distillMaxInputChars: number
+  /** 蒸馏用 provider；空则复用主模型路由。 */
+  distillProvider: string
+  /** 蒸馏用 model；空则复用主模型路由。 */
+  distillModel: string
+  /** 同一会话蒸馏最小间隔（毫秒）。 */
+  distillCooldownMs: number
 }
 
 /** Schemastery 配置 schema（与 Config 一一对应，带默认值）。 */
@@ -80,6 +105,12 @@ export const Config: z<Config> = z.object({
   maxInjectionChars: z.number().min(50).max(4000).default(400),
   injectionCooldownMs: z.number().min(1000).max(3600000).default(120000),
   scanOnStart: z.boolean().default(true),
+  distillEnabled: z.boolean().default(false),
+  distillMinNewUserMessages: z.number().min(1).max(100).default(6),
+  distillMaxInputChars: z.number().min(200).max(20000).default(6000),
+  distillProvider: z.string().default(''),
+  distillModel: z.string().default(''),
+  distillCooldownMs: z.number().min(5000).max(3600000).default(120000),
 })
 
 /**
@@ -217,6 +248,66 @@ export function apply(ctx: AppContext, config: Config): void {
     } catch (e) {
       ctx.logger?.warn?.(`[cognigraph] 痕迹投影失败：${String(e)}`)
     }
+  })
+
+  // ─── 决策层：LLM 蒸馏（默认关闭，distillEnabled 开启）───
+  // 主模型路由捕获（waterfall 必须 next() 委托）：蒸馏无配置路由时复用主模型。
+  let lastRoute: { provider: string; model: string } | null = null
+  ctx.on('llm/stream', ((options: { provider: string; model: string }, next: () => unknown) => {
+    lastRoute = { provider: options.provider, model: options.model }
+    return next()
+  }) as never)
+  const distillConfig: DistillConfig = {
+    enabled: config.distillEnabled,
+    minNewUserMessages: config.distillMinNewUserMessages,
+    maxInputChars: config.distillMaxInputChars,
+    provider: config.distillProvider,
+    model: config.distillModel,
+    cooldownMs: config.distillCooldownMs,
+  }
+  // 每会话的消息投影缓冲（只留文本，供蒸馏输入；上限防内存膨胀）
+  const distillBuffers = new Map<string, { messages: { role: string; content: unknown }[]; lastDistillAt: number }>()
+  const MAX_BUFFER_MESSAGES = 400
+  ctx.on('session/event', (session: { id: string }, event: TraceEvent) => {
+    if (!config.distillEnabled) return
+    if (event.type !== 'user/message' && event.type !== 'assistant/message') return
+    try {
+      const buf = distillBuffers.get(session.id) ?? { messages: [], lastDistillAt: 0 }
+      const data = (event.data ?? {}) as { message?: { content: unknown } }
+      if (data.message) {
+        buf.messages.push({ role: event.type === 'user/message' ? 'user' : 'assistant', content: data.message.content })
+        if (buf.messages.length > MAX_BUFFER_MESSAGES) buf.messages.splice(0, buf.messages.length - MAX_BUFFER_MESSAGES)
+      }
+      distillBuffers.set(session.id, buf)
+    } catch {
+      // 投影失败不影响会话
+    }
+  })
+  // turn/end 时检查是否该蒸馏（dsh 扩展事件，经宽松 ctx 注册）
+  ;(ctx as unknown as { on(event: string, listener: (...args: any[]) => void): unknown }).on('turn/end', (session: { id: string }) => {
+    if (!config.distillEnabled) return
+    const buf = distillBuffers.get(session.id)
+    if (!buf) return
+    const now = Date.now()
+    if (now - buf.lastDistillAt < distillConfig.cooldownMs) return
+    const userCount = buf.messages.filter((m) => m.role === 'user').length
+    if (userCount < distillConfig.minNewUserMessages) return
+    buf.lastDistillAt = now
+    void (async () => {
+      const llm = ctx.get('llm') as DistillLlm | undefined
+      if (!llm) {
+        ctx.logger?.warn?.('[cognigraph] 蒸馏跳过：llm 服务不可用')
+        return
+      }
+      const result = await distill(graph, llm, buf.messages, distillConfig, lastRoute, 0)
+      if (result.error) {
+        ctx.logger?.info?.(`[cognigraph] 蒸馏：${result.error}`)
+      } else if (result.extracted > 0) {
+        ctx.logger?.info?.(`[cognigraph] 蒸馏完成：提取 ${result.extracted} 条决策`)
+        // 蒸馏产物落盘（journal 已含节点/边；此处强制 flush 防退出丢数据）
+        void graph.appendJournal(graph.exportJournal()).catch(() => {})
+      }
+    })().catch((e) => ctx.logger?.warn?.(`[cognigraph] 蒸馏失败：${String(e)}`))
   })
 
   // ─── 模型面工具 ───
@@ -441,6 +532,74 @@ export function apply(ctx: AppContext, config: Config): void {
       })
     },
     presentCall: (args) => ({ card: 'generic', title: '行为热图与雷区', kind: 'other', rawInput: args }),
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'cg_learn',
+    description: [
+      '把一条值得长期记住的工程知识存档进认知图谱：架构决策（为什么这样设计）、',
+      '踩坑教训（什么导致了失败）、仓库约定（本仓库的特殊规矩）。',
+      '用法：任务中产生了这类知识时主动调用——自动蒸馏不可靠的场景，手动存档是零成本兜底。',
+      '存档后，改到相关文件时图谱会召回这条知识。',
+    ].join(' '),
+    parameters: {
+      kind: {
+        type: 'string',
+        required: true,
+        enum: ['decision', 'trap', 'habit'],
+        description: '知识类型：decision=架构决策，trap=踩坑教训，habit=仓库约定。',
+      },
+      topic: {
+        type: 'string',
+        required: true,
+        description: '一句话主题（≤40 字），如"session 获取必须用 withInitiator"。',
+      },
+      conclusion: {
+        type: 'string',
+        required: true,
+        description: '结论正文（≤200 字），说明为什么/怎么做。',
+      },
+      files: {
+        type: 'array',
+        items: { type: 'string' },
+        description: '相关文件路径列表（相对工作区）；不确定可省略。',
+      },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          stored: { type: 'boolean', required: true },
+          linkedFiles: {
+            type: 'array',
+            required: true,
+            items: { type: 'string' },
+          },
+        },
+      },
+      render: (_args, value) => [{
+        type: 'text',
+        text: value.stored
+          ? `已存档决策，关联 ${value.linkedFiles.length} 个文件：${value.linkedFiles.join(', ') || '（未命中，仅主题可检索）'}`
+          : '存档失败。',
+      }],
+    },
+    execute(args, exec) {
+      const fact: DistilledFact = {
+        kind: args.kind as DistilledFact['kind'],
+        topic: String(args.topic).slice(0, 120),
+        conclusion: String(args.conclusion).slice(0, 500),
+        files: Array.isArray(args.files) ? args.files.map((f) => String(f)) : [],
+      }
+      const seq = exec.agent?.session.seq ?? 0
+      const hitIds = applyDistilledFact(graph, fact, seq)
+      const hitNames = hitIds
+        .map((id) => graph.getNode(id)?.name)
+        .filter((n): n is string => n !== undefined)
+      return Promise.resolve({ stored: true, linkedFiles: hitNames })
+    },
+    presentCall: (args) => ({ card: 'generic', title: '存档决策', kind: 'other', rawInput: args.topic }),
   }))
 
   // ─── 生命周期：退出时落盘全量日志 ───

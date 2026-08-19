@@ -54,7 +54,7 @@ DSH_CHECKOUT=<checkout> bash scripts/build.sh
 dev_inject_plugin D:/agent/dshWorkSpace/dsh-repo-cognigraph
 ```
 
-注入即完整生效：三个模型面工具 + 会话痕迹追踪 + 雷区注入 + 图谱面板。
+注入即完整生效：四个模型面工具 + 会话痕迹追踪 + 雷区注入 + 决策蒸馏 + 图谱面板。
 
 ## 配置（cordis.yml 全部可覆盖）
 
@@ -71,6 +71,11 @@ dev_inject_plugin D:/agent/dshWorkSpace/dsh-repo-cognigraph
 | `maxInjectionChars` | 400 | 单次注入警告长度上限 |
 | `injectionCooldownMs` | 120000 | 同文件注入冷却（防刷屏） |
 | `scanOnStart` | `true` | 启动时自动扫描建静态图 |
+| `distillEnabled` | `false` | 决策蒸馏层开关（LLM，默认关） |
+| `distillMinNewUserMessages` | 6 | 自上次蒸馏以来新增 user 消息 ≥ 该值才触发 |
+| `distillMaxInputChars` | 6000 | 单次蒸馏输入上限（超长裁头） |
+| `distillProvider` / `distillModel` | `''` | 蒸馏用路由；空则复用主模型 |
+| `distillCooldownMs` | 120000 | 同会话蒸馏最小间隔 |
 
 示例：
 
@@ -101,6 +106,21 @@ dev_inject_plugin D:/agent/dshWorkSpace/dsh-repo-cognigraph
 新任务开始时查认知热点（高频读/改/错文件），遇到报错时查雷区清单。参数：`limit`、
 `minReads`、`showTrapsOnly`。
 
+### cg_learn — 手动存档决策
+
+把一条值得长期记住的工程知识存档进图谱：架构决策 / 踩坑教训 / 仓库约定。
+自动蒸馏不可靠的场景（长会话、快速任务），agent 主动调用是零 LLM 成本的兜底。
+存档为 Decision 节点 + Records 边（关联相关文件），后续 `cg_query` 可沿边召回。
+
+## 决策蒸馏层（LLM，默认关闭）
+
+`distillEnabled: true` 开启后，每次 turn/end 检查：自上次蒸馏以来新增 user 消息
+≥ `distillMinNewUserMessages` 且距上次蒸馏 ≥ `distillCooldownMs`，则把最近
+`distillMaxInputChars` 字符的会话文本送给 LLM，提取 JSON 数组
+（`{kind: decision|trap|habit, topic, conclusion, files[]}`），严格解析后落图为
+Decision 节点 + Records 边，带 `sourceEventSeqs` 证据链。LLM 输出不可解析时静默跳过，
+不影响会话。路由缺省复用主模型（`llm/stream` 捕获），也可用 `distillProvider`/`distillModel` 指定。
+
 ## 雷区注入
 
 当 agent 即将读取/编辑一个历史错误 ≥ `trapErrorThreshold` 的文件时，插件经 `agent.inject()`
@@ -115,11 +135,11 @@ dev_inject_plugin D:/agent/dshWorkSpace/dsh-repo-cognigraph
 
 ## Model Experience
 
-### 模型面工具（三个工具 schema 进入系统提示装配）
+### 模型面工具（四个工具 schema 进入系统提示装配）
 
 #### What the model sees
 
-`cg_query`、`cg_impact`、`cg_trace` 三个工具的 name/description/parameters 经
+`cg_query`、`cg_impact`、`cg_trace`、`cg_learn` 四个工具的 name/description/parameters 经
 `ctx.tools.register(defineTool(...))` 注册后，由系统提示装配自动并入模型可见的工具
 schema。描述文本即本插件 `src/index.ts` 中 `defineTool` 的 `description` 字段原文。
 
@@ -158,5 +178,5 @@ append-only：注入文本追加在历史尾部，不替换既有请求前缀；
   配对依赖 dsh 事件流顺序，当前用失败文本中的路径做低噪声匹配
 - **静态层不增量更新** — 工作区文件变更后需重载插件（或手动触发扫描）重建；文件系统
   watch 属后续工作
-- **决策层（LLM 蒸馏）未实现** — 设计上由生态记忆插件（如 dsh-memory 系）补齐，本插件
-  专注结构图 + 行为痕迹
+- **自动蒸馏依赖 LLM 路由** — 无主模型路由且未配置 `distillProvider`/`distillModel` 时
+  蒸馏静默跳过；`cg_learn` 手动存档不受影响（零 LLM）

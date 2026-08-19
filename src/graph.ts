@@ -33,6 +33,7 @@ export type EdgeType =
   | 'RuntimeCalls'
   | 'Traces' // 会话痕迹：agent 曾读取/编辑过该节点
   | 'FallInto' // 落入雷区：agent 操作该节点时曾出错
+  | 'Records' // 决策记录：Decision 节点 → 相关代码实体
 
 /** 一个代码/知识节点。 */
 export interface GraphNode {

@@ -7,6 +7,7 @@ import { importCodeGraphJson, mapEdgeType, mapNodeType } from '../src/codegraph-
 import { scanWorkspace, collectSourceFiles, resolveImport } from '../src/scanner.ts'
 import { projectToolCall, normalizePath } from '../src/trace.ts'
 import { parseSourceFile, isSupportedSource } from '../src/ts-parser.ts'
+import { parseDistillJson, tailMessages, applyDistilledFact } from '../src/distill.ts'
 
 /** 每个用例的独立临时目录，用后即删。 */
 let tmp: string
@@ -212,5 +213,89 @@ describe('痕迹层', () => {
     const id = projectToolCall(graph, 'web_search', { query: 'x' }, false, null, 1, { trapErrorThreshold: 3, recordTraces: false })
     expect(id).toBeUndefined()
     expect(graph.nodeCount).toBe(0)
+  })
+})
+
+describe('决策蒸馏层', () => {
+  it('parseDistillJson 解析干净 JSON 数组', () => {
+    const facts = parseDistillJson(JSON.stringify([
+      { kind: 'decision', topic: '用 withInitiator', conclusion: 'session 获取必须走 initiator', files: ['src/a.ts'] },
+    ]))
+    expect(facts).not.toBeNull()
+    expect(facts![0].kind).toBe('decision')
+    expect(facts![0].topic).toBe('用 withInitiator')
+  })
+
+  it('parseDistillJson 容忍 ```json 围栏与噪声', () => {
+    const facts = parseDistillJson('```json\n[{"kind":"trap","topic":"别用 fs.writeFileSync","conclusion":"大文件会阻塞","files":[]}]\n```')
+    expect(facts).not.toBeNull()
+    expect(facts![0].kind).toBe('trap')
+  })
+
+  it('parseDistillJson 拒绝非法输出', () => {
+    expect(parseDistillJson('这不是 JSON')).toBeNull()
+    expect(parseDistillJson('{"not":"array"}')).toBeNull()
+    expect(parseDistillJson('[]')).toBeNull()
+  })
+
+  it('parseDistillJson 从夹带解释的文本中提取数组', () => {
+    const facts = parseDistillJson('好的，以下是提取结果：\n[{"kind":"habit","topic":"pnpm 命令","conclusion":"先看 AGENTS.md","files":["AGENTS.md"]}]\n以上。')
+    expect(facts).not.toBeNull()
+    expect(facts![0].kind).toBe('habit')
+  })
+
+  it('tailMessages 取最近片段并裁头', () => {
+    const messages = [
+      { role: 'user' as const, content: 'a'.repeat(100) },
+      { role: 'assistant' as const, content: 'b'.repeat(100) },
+      { role: 'user' as const, content: 'c'.repeat(100) },
+    ]
+    const { text, count } = tailMessages(messages, 250)
+    expect(count).toBe(2) // 最近两条
+    expect(text).toContain('c')
+    expect(text).not.toContain('a')
+  })
+
+  it('tailMessages 兼容 content-block 数组', () => {
+    const messages = [
+      { role: 'user' as const, content: [{ type: 'text', text: 'hello' }, { type: 'text', text: ' world' }] },
+    ]
+    const { text } = tailMessages(messages, 1000)
+    expect(text).toContain('hello')
+    expect(text).toContain('world')
+  })
+
+  it('applyDistilledFact 挂 Decision 节点 + Records 边到命中文件', () => {
+    const graph = new CogniGraph(join(tmp, 'g.jsonl'))
+    const fileId = graph.upsertNode('CodeFile', 'src/a.ts', 'src/a.ts', 1)
+    const hits = applyDistilledFact(graph, {
+      kind: 'decision',
+      topic: '用 withInitiator',
+      conclusion: 'session 获取必须走 initiator',
+      files: ['src/a.ts'],
+    }, 5)
+    expect(hits).toEqual([fileId])
+    // Decision 节点存在，Records 边存在
+    const decision = graph.allNodes().find((n) => n.type === 'Decision')
+    expect(decision).toBeDefined()
+    expect(decision!.sourceEventSeqs).toContain(5)
+    const records = graph.allEdges().filter((e) => e.type === 'Records')
+    expect(records.length).toBe(1)
+    expect(records[0]!.source).toBe(decision!.id)
+    expect(records[0]!.target).toBe(fileId)
+  })
+
+  it('applyDistilledFact 未命中文件时仍建孤立 Decision 节点', () => {
+    const graph = new CogniGraph(join(tmp, 'g.jsonl'))
+    const hits = applyDistilledFact(graph, {
+      kind: 'habit',
+      topic: 'pnpm 先看文档',
+      conclusion: '跑命令前先读 AGENTS.md',
+      files: ['不存在的文件.ts'],
+    }, 3)
+    expect(hits).toEqual([])
+    const decision = graph.allNodes().find((n) => n.type === 'Decision')
+    expect(decision).toBeDefined()
+    expect(graph.allEdges().filter((e) => e.type === 'Records').length).toBe(0)
   })
 })
