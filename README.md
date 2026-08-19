@@ -24,6 +24,26 @@ CodeGraph 的 dsh 原生前端 + 会话痕迹增强层。把"agent 探索代码�
           webServer API（/api/stats、/api/graph）→ client 图谱可视化面板
 ```
 
+## 性能实验（确定性、可复现）
+
+对比"无图探索"（真实模拟 agent 的 grep + 读文件）与"有图查询"完成同一任务的成本。
+无 LLM 参与，结果可复现：`node experiments/benchmark.mjs`（默认读 ~/.dsh/cognigraph/graph.jsonl）。
+
+| 实验 | 场景 | 无图工具调用 | 有图工具调用 | 无图 token | 有图 token |
+|---|---|---|---|---|---|
+| A. 影响分析 | 改 types.ts 会波及谁 | 162 次 | **1 次** (-99%) | 513,610 | **137** (-100%) |
+| B. 依赖查询 | dsh-session 模块子图 | 582 次 | **1 次** (-100%) | 2,203,921 | **28,867** (-99%) |
+| C. 符号定位 | collectSessionCallbacks 定义与引用 | 2 次 | **1 次** (-50%) | 12,977 | **52** (-100%) |
+| **汇总均值** | | | **-83%** | | **≈-100%** |
+
+实测数据（dsh 仓库，15486 节点 / 25032 边）：
+- `cg_impact types.ts` 一次返回 8 个受影响文件（含测试），无图需 grep + 读 161 个文件确认
+- `cg_query` 一次返回结构化子图，无图需读 581 个文件
+- 与 CodeGraph 社区报告（[工具调用减少 58%](https://dev.to/jovan_chan_9500711396d4e6/codegraph-setup-guide-2026-cut-claude-code-tool-calls-by-58-41ln)、[token 减少 64%](https://dev.to/hiroki-ii-ai/codegraph-the-tool-that-cut-my-claude-code-token-usage-by-64-1k32)）口径一致，本实验为确定性复现，非经验报告
+
+**诚实边界**：实验 C 揭示内置解析器不产生 Calls 边（只解析 import/顶层声明），
+"谁调用谁"的精确调用图需 CodeGraph 导入（38 语言 tree-sitter）补齐——这正是不重复造轮子的依据。
+
 ## 快速开始
 
 ```bash
