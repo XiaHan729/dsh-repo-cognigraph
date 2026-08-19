@@ -1,33 +1,41 @@
-# @dsh-external/dsh-repo-cognigraph — 仓库认知图谱增强层
+# @dsh-external/dsh-repo-cognigraph
 
-CodeGraph 的 dsh 原生前端 + 会话痕迹增强层。把"agent 探索代码库"变成"查询认知图谱"：
-静态代码图（复用 CodeGraph 产物或内置解析）+ 会话痕迹热图（读/改/错行为统计）+ 雷区注入（带证据链警告）。
+给 dsh agent 一张"带脚印的代码地图"：静态代码图（CodeGraph 数据导入或内置 TS/JS 解析）+ 会话痕迹热图（读/改/错行为统计）+ 雷区注入（带证据链警告）+ 决策蒸馏（LLM）。
 
-**设计立场**：不重复造轮子。解析引擎优先消费 [CodeGraph](https://github.com/codegraph-ai/CodeGraph)
-的 D3 JSON export（38 语言 tree-sitter），内置 TS/JS 解析器仅作无 CodeGraph 时的兜底；
-真正的差异化是 CodeGraph 没有的会话动态层——它看不到 dsh 的 session log，而本插件把它投影为行为热图。
+## 功能
 
-## 架构
+### 模型面工具（4 个）
 
-```
-模型面工具：cg_query（子图查询） cg_impact（影响分析） cg_trace（行为热图+雷区）
-                    │
-            CogniGraph 服务（内存图 + JSONL 写前日志持久化）
-          ┌─────────┴──────────┐
-   静态层（代码图）        动态层（会话痕迹）
-   CodeGraph JSON 导入      session/event 订阅
-   或内置 TS/JS 解析        read/edit/error 计数
-                            错误超阈值 → Trap 节点
-                    │
-          agent 接近 Trap 文件 → agent.inject() 雷区警告（带 sourceEventSeqs 证据）
-                    │
-          webServer API（/api/stats、/api/graph）→ client 图谱可视化面板
-```
+| 工具 | 功能 |
+|---|---|
+| `cg_query` | 子图查询：从文件/符号出发沿依赖边遍历，返回带行为统计的邻居清单 |
+| `cg_impact` | 影响分析：改 X 会波及谁（反向依赖闭包，含测试文件） |
+| `cg_trace` | 行为热图 + 雷区：高频读/改/错文件与历史出错文件 |
+| `cg_learn` | 手动存档决策：架构决策 / 踩坑教训 / 仓库约定（零 LLM 成本） |
+
+### 数据层
+
+- **静态代码图**：CodeGraph D3 JSON 导入（38 语言 tree-sitter），或内置 TS/JS 解析器扫描兜底
+- **会话痕迹**：订阅 `session/event`，把 agent 的读/改/错投影为节点行为统计，错误超阈值自动升级 Trap 雷区
+- **决策节点**：Decision 节点 + Records 边关联相关文件，带 `sourceEventSeqs` 证据链
+- **持久化**：`~/.dsh/cognigraph/graph.jsonl`（写前日志，退出全量落盘）
+
+### 雷区注入
+
+agent 即将读取/编辑历史错误 ≥ `trapErrorThreshold` 的文件时，经 `agent.inject()` 注入警告（错误次数 + 最后错误文本 + 证据 seq）。冷却期内不重复注入。
+
+### 决策蒸馏（LLM，默认关闭）
+
+`distillEnabled: true` 开启后，turn/end 时若新增 user 消息 ≥ `distillMinNewUserMessages` 且距上次蒸馏 ≥ `distillCooldownMs`，把最近会话文本送 LLM，提取 `{kind: decision|trap|habit, topic, conclusion, files[]}` JSON，落图为 Decision 节点 + Records 边。输出不可解析时静默跳过。路由缺省复用主模型，可用 `distillProvider`/`distillModel` 指定。
+
+### 图谱面板
+
+`conversation.view` slot：力导向图谱可视化 + 雷区/热点侧栏（数据来自 `/api/stats`、`/api/graph`）。
 
 ## 性能实验（确定性、可复现）
 
 对比"无图探索"（真实模拟 agent 的 grep + 读文件）与"有图查询"完成同一任务的成本。
-无 LLM 参与，结果可复现：`node experiments/benchmark.mjs`（默认读 ~/.dsh/cognigraph/graph.jsonl）。
+无 LLM 参与，结果可复现：`node experiments/benchmark.mjs`。
 
 | 实验 | 场景 | 无图工具调用 | 有图工具调用 | 无图 token | 有图 token |
 |---|---|---|---|---|---|
@@ -39,10 +47,8 @@ CodeGraph 的 dsh 原生前端 + 会话痕迹增强层。把"agent 探索代码�
 实测数据（dsh 仓库，15486 节点 / 25032 边）：
 - `cg_impact types.ts` 一次返回 8 个受影响文件（含测试），无图需 grep + 读 161 个文件确认
 - `cg_query` 一次返回结构化子图，无图需读 581 个文件
-- 与 CodeGraph 社区报告（[工具调用减少 58%](https://dev.to/jovan_chan_9500711396d4e6/codegraph-setup-guide-2026-cut-claude-code-tool-calls-by-58-41ln)、[token 减少 64%](https://dev.to/hiroki-ii-ai/codegraph-the-tool-that-cut-my-claude-code-token-usage-by-64-1k32)）口径一致，本实验为确定性复现，非经验报告
 
-**诚实边界**：实验 C 揭示内置解析器不产生 Calls 边（只解析 import/顶层声明），
-"谁调用谁"的精确调用图需 CodeGraph 导入（38 语言 tree-sitter）补齐——这正是不重复造轮子的依据。
+**诚实边界**：实验 C 揭示内置解析器不产生 Calls 边（只解析 import/顶层声明），"谁调用谁"的精确调用图需 CodeGraph 导入补齐。
 
 ## 快速开始
 
@@ -54,14 +60,12 @@ DSH_CHECKOUT=<checkout> bash scripts/build.sh
 dev_inject_plugin D:/agent/dshWorkSpace/dsh-repo-cognigraph
 ```
 
-注入即完整生效：四个模型面工具 + 会话痕迹追踪 + 雷区注入 + 决策蒸馏 + 图谱面板。
-
 ## 配置（cordis.yml 全部可覆盖）
 
 | 字段 | 默认 | 含义 |
 |---|---|---|
-| `dataDir` | `~/.dsh/cognigraph` | 图数据目录（graph.jsonl 写前日志） |
-| `workspace` | `process.cwd()` | 工作区根（静态层扫描与路径归一化基准） |
+| `dataDir` | `~/.dsh/cognigraph` | 图数据目录 |
+| `workspace` | `process.cwd()` | 工作区根 |
 | `excludeDirs` | node_modules/.git/dist/lib/build/.pnpm/coverage/.dsh | 扫描排除目录 |
 | `maxScanFiles` | 3000 | 单次扫描最大文件数 |
 | `codegraphExportPath` | `''` | CodeGraph D3 JSON 路径；空则内置解析 |
@@ -69,12 +73,12 @@ dev_inject_plugin D:/agent/dshWorkSpace/dsh-repo-cognigraph
 | `trapErrorThreshold` | 3 | errorCount ≥ 该值升级 Trap；0 关闭 |
 | `trapInjectionEnabled` | `true` | 雷区注入开关 |
 | `maxInjectionChars` | 400 | 单次注入警告长度上限 |
-| `injectionCooldownMs` | 120000 | 同文件注入冷却（防刷屏） |
+| `injectionCooldownMs` | 120000 | 同文件注入冷却 |
 | `scanOnStart` | `true` | 启动时自动扫描建静态图 |
 | `distillEnabled` | `false` | 决策蒸馏层开关（LLM，默认关） |
-| `distillMinNewUserMessages` | 6 | 自上次蒸馏以来新增 user 消息 ≥ 该值才触发 |
-| `distillMaxInputChars` | 6000 | 单次蒸馏输入上限（超长裁头） |
-| `distillProvider` / `distillModel` | `''` | 蒸馏用路由；空则复用主模型 |
+| `distillMinNewUserMessages` | 6 | 蒸馏触发的最小新增 user 消息数 |
+| `distillMaxInputChars` | 6000 | 单次蒸馏输入上限 |
+| `distillProvider` / `distillModel` | `''` | 蒸馏路由；空则复用主模型 |
 | `distillCooldownMs` | 120000 | 同会话蒸馏最小间隔 |
 
 示例：
@@ -88,50 +92,9 @@ dev_inject_plugin D:/agent/dshWorkSpace/dsh-repo-cognigraph
     trapErrorThreshold: 2
 ```
 
-## 模型面工具
+## 测试
 
-### cg_query — 子图查询
-
-回答"谁依赖 X / X 依赖谁 / 改 X 涉及哪些文件"。参数：`target`（文件路径或符号名）、
-`depth`（默认 2）、`edgeTypes`（默认 Imports+Calls+Contains）、`direction`（默认 both）。
-返回带行为统计（readCount/editCount/errorCount）的邻居清单。
-
-### cg_impact — 影响分析
-
-改代码前调用：沿 Imports/Calls/Extends/Contains 反向遍历依赖闭包，返回受影响文件清单。
-参数：`target`、`depth`（默认 3）。
-
-### cg_trace — 行为热图与雷区
-
-新任务开始时查认知热点（高频读/改/错文件），遇到报错时查雷区清单。参数：`limit`、
-`minReads`、`showTrapsOnly`。
-
-### cg_learn — 手动存档决策
-
-把一条值得长期记住的工程知识存档进图谱：架构决策 / 踩坑教训 / 仓库约定。
-自动蒸馏不可靠的场景（长会话、快速任务），agent 主动调用是零 LLM 成本的兜底。
-存档为 Decision 节点 + Records 边（关联相关文件），后续 `cg_query` 可沿边召回。
-
-## 决策蒸馏层（LLM，默认关闭）
-
-`distillEnabled: true` 开启后，每次 turn/end 检查：自上次蒸馏以来新增 user 消息
-≥ `distillMinNewUserMessages` 且距上次蒸馏 ≥ `distillCooldownMs`，则把最近
-`distillMaxInputChars` 字符的会话文本送给 LLM，提取 JSON 数组
-（`{kind: decision|trap|habit, topic, conclusion, files[]}`），严格解析后落图为
-Decision 节点 + Records 边，带 `sourceEventSeqs` 证据链。LLM 输出不可解析时静默跳过，
-不影响会话。路由缺省复用主模型（`llm/stream` 捕获），也可用 `distillProvider`/`distillModel` 指定。
-
-## 雷区注入
-
-当 agent 即将读取/编辑一个历史错误 ≥ `trapErrorThreshold` 的文件时，插件经 `agent.inject()`
-向下一请求注入 ≤ `maxInjectionChars` 字符的警告，包含错误次数、最后错误文本、
-`sourceEventSeqs` 证据链（指向 session log 原文）。冷却期内不重复注入。
-
-## 数据与隐私
-
-- 只读投影：仅订阅 `session/event` 读取，绝不写 session log
-- 持久化：`~/.dsh/cognigraph/graph.jsonl`（节点/边/计数写前日志，退出时全量落盘）
-- 路径归一化：绝对路径按工作区剥离为相对路径，与静态层节点统一
+26 个 vitest 用例：图算法（幂等/去重/BFS/影响闭包/Trap 升级/热图/持久化重放）、CodeGraph 导入（映射/回退/悬挂引用）、内置解析、扫描器、痕迹层、决策蒸馏（JSON 解析容错/尾消息截取/落图挂边）。
 
 ## Model Experience
 
