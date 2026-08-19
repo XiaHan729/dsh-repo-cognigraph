@@ -50,15 +50,41 @@ agent 即将读取/编辑历史错误 ≥ `trapErrorThreshold` 的文件时，�
 
 **诚实边界**：实验 C 揭示内置解析器不产生 Calls 边（只解析 import/顶层声明），"谁调用谁"的精确调用图需 CodeGraph 导入补齐。
 
-## 快速开始
+## 安装
+
+### 方式 A：从 GitHub 安装（推荐）
 
 ```bash
-# 构建（无 bash 环境时手动：junction 链接依赖 + checkout tsc + tsdown）
-DSH_CHECKOUT=<checkout> bash scripts/build.sh
-
-# 注入（dsh-super-injector 环境内）
-dev_inject_plugin D:/agent/dshWorkSpace/dsh-repo-cognigraph
+dsh plugin add github:XiaHan729/dsh-repo-cognigraph
 ```
+
+### 方式 B：网页端安装
+
+1. 启动 dsh Web：`dsh web`
+2. 访问 `http://127.0.0.1:3080`
+3. 设置 → 插件 → 添加
+4. 填入 `github:XiaHan729/dsh-repo-cognigraph`
+
+### 方式 C：本地开发模式
+
+```bash
+git clone https://github.com/XiaHan729/dsh-repo-cognigraph.git
+cd dsh-repo-cognigraph
+pnpm install
+DSH_CHECKOUT=<你的 dsh 源码目录> bash scripts/build.sh
+
+# 注入器环境（dsh-super-injector）内运行时注入
+dev_inject_plugin <本插件目录>
+```
+
+### 验证安装
+
+```bash
+dsh plugin list   # 确认 dsh-repo-cognigraph 处于 active
+dsh doctor        # 诊断插件加载错误
+```
+
+注入即完整生效：四个模型面工具 + 会话痕迹追踪 + 雷区注入 + 决策蒸馏 + 图谱面板。
 
 ## 配置（cordis.yml 全部可覆盖）
 
